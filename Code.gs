@@ -8,7 +8,7 @@ function onOpen() {
     .addItem('Initialize Sheets', 'initializeTaskSystem')
     .addItem('Create Daily Trigger', 'createDailyTrigger')
     .addItem('Send Pending Tasks Now', 'sendDailyPendingTasks')
-    .addItem('Test Message Preview', 'testMessage')
+    .addItem('Test Template Send', 'testTemplateSend')
     .addToUi();
 }
 
@@ -47,7 +47,7 @@ function initializeTaskSystem() {
   ensureDefaultSettings(settingsSheet);
 
   SpreadsheetApp.flush();
-  SpreadsheetApp.getUi().alert('✓ Sheets initialized successfully!\n\nNext steps:\n1. Update Settings tab with WhatsApp credentials\n2. Add tasks to Tasks tab\n3. Click "Send Pending Tasks Now" to test');
+  SpreadsheetApp.getUi().alert('✓ Sheets initialized successfully!');
 }
 
 function createDailyTrigger() {
@@ -68,7 +68,7 @@ function createDailyTrigger() {
     .nearMinute(0)
     .create();
 
-  SpreadsheetApp.getUi().alert('✓ Daily trigger created for 9:00 AM IST');
+  SpreadsheetApp.getUi().alert('✓ Daily trigger created for 9:00 AM');
 }
 
 function ensureHeaders(sheet, headers) {
@@ -100,8 +100,8 @@ function ensureDefaultSettings(settingsSheet) {
     ['PHONE_NUMBER_ID', 'YOUR_PHONE_NUMBER_ID'],
     ['API_VERSION', 'v18.0'],
     ['API_BASE_URL', 'https://graph.facebook.com'],
-    ['SCHEDULE_HOUR', '9'],
-    ['MESSAGE_TEMPLATE', 'Hello {name},\n\nYou have {count} pending task(s):\n\n{task_list}\n\nPlease complete these today.']
+    ['TEMPLATE_NAME', 'daily_task_reminder'],
+    ['TEMPLATE_LANGUAGE', 'en_US']
   ];
 
   const existing = settingsSheet.getDataRange().getValues();
@@ -177,27 +177,7 @@ function getTasks() {
 
 function normalizePhoneNumber(phone) {
   if (!phone) return '';
-  return String(phone)
-    .replace(/[^0-9+]/g, '')
-    .replace(/^00/, '+')
-    .trim();
-}
-
-function formatDate(value) {
-  if (!value) {
-    return 'Not specified';
-  }
-
-  if (value instanceof Date) {
-    return value.toISOString().split('T')[0];
-  }
-
-  const dateValue = new Date(value);
-  if (!isNaN(dateValue.getTime())) {
-    return dateValue.toISOString().split('T')[0];
-  }
-
-  return String(value);
+  return String(phone).replace(/\D/g, '').trim();
 }
 
 function getPendingTasksByUser() {
@@ -208,65 +188,68 @@ function getPendingTasksByUser() {
     const status = String(task.status || '').trim().toLowerCase();
     const phone = normalizePhoneNumber(task.assigneePhone);
 
-    if (!phone) {
-      return;
-    }
+    if (!phone) return;
 
     if (status === 'completed' || status === 'done' || status === 'closed') {
       return;
     }
 
-    const userKey = phone;
-    if (!grouped[userKey]) {
-      grouped[userKey] = {
+    if (!grouped[phone]) {
+      grouped[phone] = {
         name: task.assigneeName || 'User',
         tasks: []
       };
     }
 
-    grouped[userKey].tasks.push(task);
+    grouped[phone].tasks.push(task);
   });
 
   return grouped;
 }
 
-function buildWhatsAppMessage(name, tasks) {
-  const settings = getSettings();
-  const template = settings.MESSAGE_TEMPLATE || 'Hello {name}, you have {count} pending task(s):\n{task_list}\nPlease complete these today.';
-
-  const taskList = tasks.map(function(task, index) {
-    const dueDate = task.dueDate ? ' (Due: ' + formatDate(task.dueDate) + ')' : '';
-    return (index + 1) + '. ' + (task.taskName || 'Untitled task') + dueDate;
-  }).join('\n');
-
-  return template
-    .replace('{name}', name)
-    .replace('{count}', tasks.length)
-    .replace('{task_list}', taskList);
-}
-
-function sendWhatsAppMessage(phoneNumber, messageBody) {
+function sendWhatsAppTemplateMessage(phoneNumber, name, count, taskList) {
   const settings = getSettings();
   const token = String(settings.WHATSAPP_TOKEN || '').trim();
   const phoneNumberId = String(settings.PHONE_NUMBER_ID || '').trim();
   const apiVersion = String(settings.API_VERSION || 'v18.0').trim();
   const baseUrl = String(settings.API_BASE_URL || 'https://graph.facebook.com').trim();
+  const templateName = String(settings.TEMPLATE_NAME || 'daily_task_reminder').trim();
+  const templateLanguage = String(settings.TEMPLATE_LANGUAGE || 'en_US').trim();
 
-  if (!token || token.indexOf('YOUR_') !== -1) {
-    throw new Error('WhatsApp token is missing or invalid. Update the Settings sheet with a valid token.');
+  if (!token || !token.startsWith('E')) {
+    throw new Error('Invalid WhatsApp token. Must start with E');
   }
 
-  if (!phoneNumberId || phoneNumberId.indexOf('YOUR_') !== -1) {
-    throw new Error('WhatsApp Phone Number ID is missing or invalid. Update the Settings sheet.');
+  if (!phoneNumberId || phoneNumberId.length < 10) {
+    throw new Error('Invalid Phone Number ID');
+  }
+
+  const cleanPhone = normalizePhoneNumber(phoneNumber);
+  if (!cleanPhone || cleanPhone.length < 10) {
+    throw new Error('Invalid phone number: ' + phoneNumber);
   }
 
   const url = baseUrl + '/' + apiVersion + '/' + phoneNumberId + '/messages';
+
   const payload = {
-    messaging_product: 'whatsapp',
-    to: normalizePhoneNumber(phoneNumber),
-    type: 'text',
-    text: {
-      body: messageBody
+    messaging_product: "whatsapp",
+    to: cleanPhone,
+    type: "template",
+    template: {
+      name: templateName,
+      language: {
+        code: templateLanguage
+      },
+      components: [
+        {
+          type: "body",
+          parameters: [
+            { type: "text", text: name },
+            { type: "text", text: String(count) },
+            { type: "text", text: taskList }
+          ]
+        }
+      ]
     }
   };
 
@@ -280,17 +263,24 @@ function sendWhatsAppMessage(phoneNumber, messageBody) {
     muteHttpExceptions: true
   };
 
-  const response = UrlFetchApp.fetch(url, options);
-  const responseCode = response.getResponseCode();
-  const responseText = response.getContentText();
+  Logger.log('=== Sending Template Message ===');
+  Logger.log('To: ' + cleanPhone);
+  Logger.log('URL: ' + url);
+  Logger.log('Template: ' + templateName);
+  Logger.log('Payload: ' + JSON.stringify(payload, null, 2));
 
-  if (responseCode >= 400) {
-    const errorMsg = 'Error: ' + responseCode + ' - ' + responseText;
-    Logger.log(errorMsg);
-    throw new Error(errorMsg);
+  const response = UrlFetchApp.fetch(url, options);
+  const status = response.getResponseCode();
+  const text = response.getContentText();
+
+  Logger.log('Response Code: ' + status);
+  Logger.log('Response Body: ' + text);
+
+  if (status >= 400) {
+    throw new Error('WhatsApp API Error ' + status + ': ' + text);
   }
 
-  return JSON.parse(responseText || '{}');
+  return JSON.parse(text || '{}');
 }
 
 function markReminderSentForTasks(phoneNumber) {
@@ -305,27 +295,28 @@ function markReminderSentForTasks(phoneNumber) {
   const phoneIndex = headers.indexOf('Assignee Phone');
   const reminderIndex = headers.indexOf('Last Reminder Sent');
 
-  if (phoneIndex === -1 || reminderIndex === -1) {
-    return;
-  }
+  if (phoneIndex === -1 || reminderIndex === -1) return;
 
   const normalizedTargetPhone = normalizePhoneNumber(phoneNumber);
   for (let i = 1; i < values.length; i++) {
     const rowPhone = normalizePhoneNumber(values[i][phoneIndex]);
     if (rowPhone === normalizedTargetPhone) {
-      const cell = sheet.getRange(i + 1, reminderIndex + 1);
-      cell.setValue(new Date());
+      sheet.getRange(i + 1, reminderIndex + 1).setValue(new Date());
     }
   }
 }
 
 function sendDailyPendingTasks() {
   try {
+    Logger.log('========== STARTING DAILY PENDING TASKS ==========');
+
     const groupedTasks = getPendingTasksByUser();
     const userPhones = Object.keys(groupedTasks);
 
+    Logger.log('Found ' + userPhones.length + ' users with pending tasks');
+
     if (!userPhones.length) {
-      Logger.log('No pending tasks found for any user.');
+      Logger.log('No pending tasks found');
       return;
     }
 
@@ -334,37 +325,61 @@ function sendDailyPendingTasks() {
 
     userPhones.forEach(function(phone) {
       const entry = groupedTasks[phone];
-      const message = buildWhatsAppMessage(entry.name, entry.tasks);
+
+      const taskList = entry.tasks.map(function(task, index) {
+        return (index + 1) + '. ' + task.taskName;
+      }).join('\n');
+
+      Logger.log('\n--- Processing: ' + entry.name + ' (' + phone + ') ---');
+      Logger.log('Tasks: ' + entry.tasks.length);
+      Logger.log('Task List:\n' + taskList);
+
       try {
-        sendWhatsAppMessage(phone, message);
+        sendWhatsAppTemplateMessage(phone, entry.name, entry.tasks.length, taskList);
         markReminderSentForTasks(phone);
-        Logger.log('✓ Message sent to ' + phone);
+        Logger.log('✅ SUCCESS - Message sent to ' + phone);
         successCount++;
       } catch (error) {
-        Logger.log('✗ Failed to send message to ' + phone + ': ' + error.message);
+        Logger.log('❌ FAILED - ' + error.message);
         failureCount++;
       }
     });
 
-    Logger.log('Daily reminder run completed - Success: ' + successCount + ', Failed: ' + failureCount);
+    Logger.log('\n========== DAILY REMINDER COMPLETED ==========');
+    Logger.log('Success: ' + successCount + ' | Failed: ' + failureCount);
+    Logger.log('============================================');
+
   } catch (error) {
-    Logger.log('Error in sendDailyPendingTasks: ' + error.message);
+    Logger.log('❌ FATAL ERROR: ' + error.message);
   }
 }
 
-function testMessage() {
+function testTemplateSend() {
   try {
+    Logger.log('=== Testing Template Send ===');
     const groupedTasks = getPendingTasksByUser();
     const firstPhone = Object.keys(groupedTasks)[0];
+
     if (!firstPhone) {
-      SpreadsheetApp.getUi().alert('❌ No pending tasks found.\n\nAdd tasks to the Tasks sheet with:\n- Status: Pending (or not Completed)\n- Assignee Phone: Valid number');
+      SpreadsheetApp.getUi().alert('❌ No pending tasks found in Tasks sheet');
       return;
     }
 
     const entry = groupedTasks[firstPhone];
-    const testMessage = buildWhatsAppMessage(entry.name, entry.tasks);
-    SpreadsheetApp.getUi().alert('📨 Sample message preview:\n\n' + testMessage + '\n\nWill be sent to: ' + firstPhone);
+    const taskList = entry.tasks.map(function(task, index) {
+      return (index + 1) + '. ' + task.taskName;
+    }).join('\n');
+
+    Logger.log('Test recipient: ' + entry.name + ' (' + firstPhone + ')');
+    Logger.log('Task count: ' + entry.tasks.length);
+    Logger.log('Task list:\n' + taskList);
+
+    sendWhatsAppTemplateMessage(firstPhone, entry.name, entry.tasks.length, taskList);
+
+    SpreadsheetApp.getUi().alert('✅ Test message sent to ' + firstPhone + '\n\nCheck Execution Log for details');
+
   } catch (error) {
-    SpreadsheetApp.getUi().alert('❌ Error: ' + error.message);
+    Logger.log('❌ Test failed: ' + error.message);
+    SpreadsheetApp.getUi().alert('❌ Test failed:\n' + error.message);
   }
 }
